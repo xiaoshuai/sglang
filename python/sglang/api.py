@@ -6,6 +6,7 @@ from sglang.backend.anthropic import Anthropic
 from sglang.backend.base_backend import BaseBackend
 from sglang.backend.openai import OpenAI
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.backend.vertexai import VertexAI
 from sglang.global_config import global_config
 from sglang.lang.ir import (
     SglExpr,
@@ -19,8 +20,16 @@ from sglang.lang.ir import (
 )
 
 
-def function(func: Callable):
-    return SglFunction(func)
+def function(
+    func: Optional[Callable] = None, api_num_spec_tokens: Optional[int] = None
+):
+    if func:
+        return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
+
+    def decorator(func):
+        return SglFunction(func, api_num_spec_tokens=api_num_spec_tokens)
+
+    return decorator
 
 
 def Runtime(*args, **kwargs):
@@ -49,7 +58,7 @@ def gen(
     regex: Optional[str] = None,
 ):
     if choices:
-        return SglSelect(name, choices, temperature)
+        return SglSelect(name, choices, 0.0 if temperature is None else temperature)
 
     # check regex is valid
     if regex is not None:

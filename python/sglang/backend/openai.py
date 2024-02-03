@@ -30,40 +30,27 @@ def create_logit_bias_int(tokenizer):
     return mask
 
 
-CHAT_MODEL_NAMES = [
-    # GPT-4
-    "gpt-4",
-    "gpt-4-32k",
-    "gpt-4-1106-preview",
-    "gpt-4-vision-preview",
-    "gpt-4-0613",
-    "gpt-4-0314",
-    # GPT-3.5
-    "gpt-3.5-turbo",
-    "gpt-3.5-turbo-16k",
-    "gpt-3.5-turbo-1106",
-    "gpt-3.5-turbo-16k-0613",
-    "gpt-3.5-turbo-0613",
-    "gpt-3.5-turbo-0301",
+INSTRUCT_MODEL_NAMES = [
+    "gpt-3.5-turbo-instruct",
 ]
 
 
 class OpenAI(BaseBackend):
     def __init__(self, model_name, *args, **kwargs):
         super().__init__()
-        self.client = openai.OpenAI(*args, **kwargs)
 
         if isinstance(openai, Exception):
-            raise e
+            raise openai
 
+        self.client = openai.OpenAI(*args, **kwargs)
         self.model_name = model_name
         self.tokenizer = tiktoken.encoding_for_model(model_name)
         self.logit_bias_int = create_logit_bias_int(self.tokenizer)
 
-        if model_name in CHAT_MODEL_NAMES:
-            self.is_chat_model = True
-        else:
+        if model_name in INSTRUCT_MODEL_NAMES:
             self.is_chat_model = False
+        else:
+            self.is_chat_model = True
 
         self.chat_template = get_chat_template("default")
 
@@ -77,7 +64,11 @@ class OpenAI(BaseBackend):
     ):
         if sampling_params.dtype is None:
             if self.is_chat_model:
-                assert s.text_.endswith("ASSISTANT:")
+                if not s.text_.endswith("ASSISTANT:"):
+                    raise RuntimeError(
+                        "This use case is not supported. "
+                        "For OpenAI chat models, sgl.gen must be right after sgl.assistant"
+                    )
                 prompt = s.messages_
             else:
                 prompt = s.text_
@@ -149,6 +140,12 @@ class OpenAI(BaseBackend):
         choices: List[str],
         temperature: float,
     ):
+        if self.is_chat_model:
+            raise NotImplementedError(
+                "select/choices is not supported for chat models. "
+                "Please try to use a non-chat model such as gpt-3.5-turbo-instruct"
+            )
+
         n_choices = len(choices)
         token_ids = [self.tokenizer.encode(x) for x in choices]
         scores = [0] * n_choices
@@ -199,7 +196,7 @@ class OpenAI(BaseBackend):
             prompt_tokens.append(ret_token)
 
         decision = choices[np.argmax(scores)]
-        return decision, scores
+        return decision, scores, scores
 
 
 def openai_completion(client, is_chat=None, prompt=None, **kwargs):
@@ -225,6 +222,8 @@ def openai_completion(client, is_chat=None, prompt=None, **kwargs):
 def openai_completion_stream(client, is_chat=None, prompt=None, **kwargs):
     try:
         if is_chat:
+            if kwargs["stop"] is None:
+                kwargs.pop("stop")
             generator = client.chat.completions.create(
                 messages=prompt, stream=True, **kwargs
             )
