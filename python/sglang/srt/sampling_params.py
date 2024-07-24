@@ -1,4 +1,5 @@
 """Sampling parameters for text generation."""
+
 from typing import List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
@@ -16,8 +17,10 @@ class SamplingParams:
         presence_penalty: float = 0.0,
         ignore_eos: bool = False,
         skip_special_tokens: bool = True,
+        spaces_between_special_tokens: bool = True,
         dtype: Optional[str] = None,
         regex: Optional[str] = None,
+        n: int = 1,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
@@ -28,8 +31,10 @@ class SamplingParams:
         self.max_new_tokens = max_new_tokens
         self.ignore_eos = ignore_eos
         self.skip_special_tokens = skip_special_tokens
+        self.spaces_between_special_tokens = spaces_between_special_tokens
         self.dtype = dtype
         self.regex = regex
+        self.n = n
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:

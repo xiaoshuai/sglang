@@ -1,9 +1,10 @@
 """Tracing a program."""
+
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from sglang.backend.base_backend import BaseBackend
 from sglang.global_config import global_config
+from sglang.lang.backend.base_backend import BaseBackend
 from sglang.lang.interpreter import ProgramState, ProgramStateGroup
 from sglang.lang.ir import (
     SglArgument,
@@ -108,19 +109,21 @@ class TracerProgramState(ProgramState):
     ########### Public API ###########
     ##################################
 
-    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
+    def fork(self, size: int = 1, position_ids_offset: Optional[List[int]] = None):
+        assert size >= 1
+
         if self.only_trace_prefix:
             raise StopTracing()
 
-        fork_node = SglFork(number)
+        fork_node = SglFork(size)
         fork_node.prev_node = self.last_node
 
         states = [
             TracerProgramState(self.backend, self.arguments, self.only_trace_prefix)
-            for _ in range(number)
+            for _ in range(size)
         ]
 
-        for i in range(number):
+        for i in range(size):
             node = SglGetForkItem(i)
             node.prev_node = fork_node
             states[i].last_node = node

@@ -1,10 +1,12 @@
+"""Conversation templates."""
+
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Optional, Tuple, Union
 
-from sglang.srt.managers.openai_protocol import ChatCompletionRequest
+from sglang.srt.openai_api.protocol import ChatCompletionRequest
 
 
 class SeparatorStyle(IntEnum):
@@ -366,7 +368,8 @@ def generate_chat_conv(
                     if content.type == "text":
                         real_content += content.text
                     elif content.type == "image_url":
-                        real_content += "<image>"
+                        # NOTE: Only works for llava
+                        real_content += "<image>\n"
                         conv.append_image(content.image_url.url)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
@@ -399,7 +402,7 @@ register_conv_template(
     Conversation(
         name="chatml",
         system_template="<|im_start|>system\n{system_message}",
-        system_message="You are an AI assistant.",
+        system_message="You are a helpful assistant.",
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep_style=SeparatorStyle.CHATML,
         sep="<|im_end|>",

@@ -1,14 +1,21 @@
-"""SRT: SGLang Runtime"""
+"""
+The entry point of inference server.
+SRT = SGLang Runtime.
+"""
+
 import asyncio
+import dataclasses
 import json
+import logging
 import multiprocessing as mp
 import os
 import sys
 import threading
 import time
-from typing import List, Optional, Union
+from http import HTTPStatus
+from typing import Dict, Optional
 
-# Fix a Python bug
+# Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
@@ -16,45 +23,49 @@ import psutil
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
-from sglang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.srt.conversation import (
-    Conversation,
-    SeparatorStyle,
-    chat_template_exists,
-    generate_chat_conv,
-    register_conv_template,
-)
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.srt.constrained import disable_cache
 from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.managers.controller.manager_multi import (
+    start_controller_process as start_controller_process_multi,
+)
+from sglang.srt.managers.controller.manager_single import launch_tp_servers
+from sglang.srt.managers.controller.manager_single import (
+    start_controller_process as start_controller_process_single,
+)
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.openai_protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionResponseChoice,
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    ChatMessage,
-    CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    CompletionResponseStreamChoice,
-    CompletionStreamResponse,
-    DeltaMessage,
-    UsageInfo,
-)
-from sglang.srt.managers.router.manager import start_router_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.openai_api.adapter import (
+    load_chat_template_for_openai_api,
+    v1_chat_completions,
+    v1_completions,
+)
+from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import alloc_usable_network_port, handle_port_init
+from sglang.srt.utils import (
+    API_KEY_HEADER_NAME,
+    APIKeyValidatorMiddleware,
+    allocate_init_ports,
+    assert_pkg_version,
+    enable_show_time_cost,
+    set_ulimit,
+)
+from sglang.utils import get_exception_traceback
+
+logger = logging.getLogger(__name__)
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 app = FastAPI()
 tokenizer_manager = None
-chat_template_name = None
+
+# Put some args for easily access
+global_server_args_dict = {}
 
 
 @app.get("/health")
@@ -71,301 +82,188 @@ async def get_model_info():
     return result
 
 
+@app.get("/get_server_args")
+async def get_server_args():
+    return dataclasses.asdict(tokenizer_manager.server_args)
+
+
 @app.get("/flush_cache")
 async def flush_cache():
-    await tokenizer_manager.flush_cache()
+    tokenizer_manager.flush_cache()
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        content="Cache flushed.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
 
-async def stream_generator(obj):
-    async for out in tokenizer_manager.generate_request(obj):
-        yield out
-
-
-@app.post("/generate")
-async def generate_request(obj: GenerateReqInput):
-    obj.post_init()
-
+async def generate_request(obj: GenerateReqInput, request: Request):
+    """Handle a generate request."""
     if obj.stream:
 
         async def stream_results():
-            async for out in stream_generator(obj):
+            try:
+                async for out in tokenizer_manager.generate_request(obj, request):
+                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+            except ValueError as e:
+                out = {"error": {"message": str(e)}}
                 yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream_results(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+            background=tokenizer_manager.create_abort_task(obj),
+        )
+    else:
+        try:
+            ret = await tokenizer_manager.generate_request(obj, request).__anext__()
+            return ret
+        except ValueError as e:
+            return JSONResponse(
+                {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
+            )
 
-    ret = await tokenizer_manager.generate_request(obj).__anext__()
-    return ret
+
+app.post("/generate")(generate_request)
+app.put("/generate")(generate_request)
 
 
 @app.post("/v1/completions")
-async def v1_completions(raw_request: Request):
-    request_json = await raw_request.json()
-    request = CompletionRequest(**request_json)
-
-    # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
-    assert request.n == 1
-
-    adapted_request = GenerateReqInput(
-        text=request.prompt,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": request.stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-        },
-        stream=request.stream,
-    )
-    adapted_request.post_init()
-
-    if adapted_request.stream:
-
-        async def gnerate_stream_resp():
-            stream_buffer = ""
-            async for content in stream_generator(adapted_request):
-                text = content["text"]
-                prompt_tokens = content["meta_info"]["prompt_tokens"]
-                completion_tokens = content["meta_info"]["completion_tokens"]
-
-                delta = text[len(stream_buffer) :]
-                stream_buffer = text
-                choice_data = CompletionResponseStreamChoice(
-                    index=0,
-                    text=delta,
-                    logprobs=None,
-                    finish_reason=None,
-                )
-                chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    object="text_completion",
-                    choices=[choice_data],
-                    model=request.model,
-                    usage=UsageInfo(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        total_tokens=prompt_tokens + completion_tokens,
-                    ),
-                )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
-
-    # Non-streaming response.
-    ret = await generate_request(adapted_request)
-
-    choice_data = CompletionResponseChoice(
-        index=0,
-        text=ret["text"],
-        logprobs=None,
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
-    )
-
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    response = CompletionResponse(
-        id=ret["meta_info"]["id"],
-        model=request.model,
-        choices=[choice_data],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-    )
-    return response
+async def openai_v1_completions(raw_request: Request):
+    return await v1_completions(tokenizer_manager, raw_request)
 
 
 @app.post("/v1/chat/completions")
-async def v1_chat_completions(raw_request: Request):
-    request_json = await raw_request.json()
-    request = ChatCompletionRequest(**request_json)
-
-    # TODO: Validate the request and return HTTPStatus.BAD_REQUEST if invalid.
-    assert request.n == 1
-
-    # Prep the data needed for the underlying GenerateReqInput:
-    #  - prompt: The full prompt string.
-    #  - stop: Custom stop tokens.
-    #  - image_data: None or a list of image strings (URLs or base64 strings).
-    #    None skips any image processing in GenerateReqInput.
-    if not isinstance(request.messages, str):
-        # Apply chat template and its stop strings.
-        if chat_template_name is None:
-            # This flow doesn't support the full OpenAI spec.  Verify messages
-            # has the right type before proceeding:
-            for m in request.messages:
-                if not isinstance(m.content, str):
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Structured content requests not supported with HuggingFace Chat Templates.  Make sure the server specifies a sglang chat template.",
-                    )
-            prompt = tokenizer_manager.tokenizer.apply_chat_template(
-                request.messages, tokenize=False, add_generation_prompt=True
-            )
-            stop = request.stop
-            image_data = None
-        else:
-            conv = generate_chat_conv(request, chat_template_name)
-            prompt = conv.get_prompt()
-            image_data = conv.image_data
-            stop = conv.stop_str or []
-            if request.stop:
-                if isinstance(request.stop, str):
-                    stop.append(request.stop)
-                else:
-                    stop.extend(request.stop)
-    else:
-        # Use the raw prompt and stop strings if the messages is already a string.
-        prompt = request.messages
-        stop = request.stop
-        image_data = None
-
-    adapted_request = GenerateReqInput(
-        text=prompt,
-        image_data=image_data,
-        sampling_params={
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
-            "stop": stop,
-            "top_p": request.top_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-        },
-        stream=request.stream,
-    )
-    adapted_request.post_init()
-
-    if adapted_request.stream:
-
-        async def gnerate_stream_resp():
-            is_first = True
-
-            stream_buffer = ""
-            async for content in stream_generator(adapted_request):
-                if is_first:
-                    # First chunk with role
-                    is_first = False
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=0,
-                        delta=DeltaMessage(role="assistant"),
-                        finish_reason=None,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-
-                text = content["text"]
-                delta = text[len(stream_buffer) :]
-                stream_buffer = text
-                choice_data = ChatCompletionResponseStreamChoice(
-                    index=0, delta=DeltaMessage(content=delta), finish_reason=None
-                )
-                chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    choices=[choice_data],
-                    model=request.model,
-                )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
-
-    # Non-streaming response.
-    ret = await generate_request(adapted_request)
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
-    choice_data = ChatCompletionResponseChoice(
-        index=0,
-        message=ChatMessage(role="assistant", content=ret["text"]),
-        finish_reason=None,  # TODO(comaniac): Add finish reason.
-    )
-    response = ChatCompletionResponse(
-        id=ret["meta_info"]["id"],
-        model=request.model,
-        choices=[choice_data],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-    )
-    return response
+async def openai_v1_chat_completions(raw_request: Request):
+    return await v1_chat_completions(tokenizer_manager, raw_request)
 
 
-def launch_server(server_args, pipe_finish_writer):
+@app.get("/v1/models")
+def available_models():
+    """Show available models."""
+    model_names = [tokenizer_manager.model_path]
+    model_cards = []
+    for model_name in model_names:
+        model_cards.append(ModelCard(id=model_name, root=model_name))
+    return ModelList(data=model_cards)
+
+
+def _set_global_server_args(server_args: ServerArgs):
+    global global_server_args_dict
+    global_server_args_dict = {
+        "disable_flashinfer": server_args.disable_flashinfer,
+        "attention_reduce_in_fp32": server_args.attention_reduce_in_fp32,
+    }
+
+
+def _set_torch_compile_config():
+    # The following configurations are for torch compile optimizations
+    import torch._dynamo.config
+    import torch._inductor.config
+
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.triton.unique_kernel_names = True
+    torch._inductor.config.fx_graph_cache = True  # Experimental feature to reduce compilation times, will be on by default in future
+
+    # FIXME: tmp workaround
+    torch._dynamo.config.accumulated_cache_size_limit = 256
+
+
+def launch_server(
+    server_args: ServerArgs,
+    model_overide_args: Optional[dict] = None,
+    pipe_finish_writer: Optional[mp.connection.Connection] = None,
+):
+    """Launch an HTTP server."""
     global tokenizer_manager
-    global chat_template_name
 
-    # Handle ports
-    server_args.port, server_args.additional_ports = handle_port_init(
-        server_args.port, server_args.additional_ports, server_args.tp_size
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format="%(message)s",
     )
 
+    # Set global environments
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+    set_ulimit()
+    if server_args.show_time_cost:
+        enable_show_time_cost()
+    if server_args.disable_disk_cache:
+        disable_cache()
+    if not server_args.disable_flashinfer:
+        assert_pkg_version(
+            "flashinfer",
+            "0.1.1",
+            "Please uninstall the old version and "
+            "reinstall the latest version by following the instructions "
+            "at https://docs.flashinfer.ai/installation.html.",
+        )
+    if server_args.chat_template:
+        # TODO: replace this with huggingface transformers template
+        load_chat_template_for_openai_api(server_args.chat_template)
+
+    if server_args.enable_torch_compile:
+        _set_torch_compile_config()
+
+    _set_global_server_args(server_args)
+
+    # Allocate ports
+    server_args.port, server_args.additional_ports = allocate_init_ports(
+        server_args.port,
+        server_args.additional_ports,
+        server_args.dp_size,
+    )
+    ports = server_args.additional_ports
     port_args = PortArgs(
-        tokenizer_port=server_args.additional_ports[0],
-        router_port=server_args.additional_ports[1],
-        detokenizer_port=server_args.additional_ports[2],
-        nccl_port=server_args.additional_ports[3],
-        model_rpc_ports=server_args.additional_ports[4:],
+        tokenizer_port=ports[0],
+        controller_port=ports[1],
+        detokenizer_port=ports[2],
+        nccl_ports=ports[3:],
     )
+    logger.info(f"{server_args=}")
 
-    # Load chat template if needed
-    if server_args.chat_template is not None:
-        print(f"Use chat template: {server_args.chat_template}")
-        if not chat_template_exists(server_args.chat_template):
-            if not os.path.exists(server_args.chat_template):
-                raise RuntimeError(
-                    f"Chat template {server_args.chat_template} is not a built-in template name "
-                    "or a valid chat template file path."
+    # Handle multi-node tensor parallelism
+    if server_args.nnodes > 1:
+        assert server_args.dp_size == 1, "Multi-node dp is not supported."
+
+        if server_args.node_rank != 0:
+            tp_size_local = server_args.tp_size // server_args.nnodes
+            gpu_ids = [
+                i for _ in range(server_args.nnodes) for i in range(tp_size_local)
+            ]
+            tp_rank_range = list(
+                range(
+                    server_args.node_rank * tp_size_local,
+                    (server_args.node_rank + 1) * tp_size_local,
                 )
-            with open(server_args.chat_template, "r") as filep:
-                template = json.load(filep)
-                try:
-                    sep_style = SeparatorStyle[template["sep_style"]]
-                except KeyError:
-                    raise ValueError(
-                        f"Unknown separator style: {template['sep_style']}"
-                    ) from None
-                register_conv_template(
-                    Conversation(
-                        name=template["name"],
-                        system_template=template["system"] + "\n{system_message}",
-                        system_message=template.get("system_message", ""),
-                        roles=(template["user"], template["assistant"]),
-                        sep_style=sep_style,
-                        sep=template.get("sep", "\n"),
-                        stop_str=template["stop_str"],
-                    ),
-                    override=True,
-                )
-            chat_template_name = template["name"]
-        else:
-            chat_template_name = server_args.chat_template
+            )
+            procs = launch_tp_servers(
+                gpu_ids,
+                tp_rank_range,
+                server_args,
+                ports[3],
+                model_overide_args,
+            )
+            while True:
+                pass
 
     # Launch processes
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    pipe_router_reader, pipe_router_writer = mp.Pipe(duplex=False)
+    tokenizer_manager = TokenizerManager(server_args, port_args, model_overide_args)
+    pipe_controller_reader, pipe_controller_writer = mp.Pipe(duplex=False)
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
-    proc_router = mp.Process(
-        target=start_router_process,
-        args=(
-            server_args,
-            port_args,
-            pipe_router_writer,
-        ),
+    if server_args.dp_size == 1:
+        start_process = start_controller_process_single
+    else:
+        start_process = start_controller_process_multi
+    proc_controller = mp.Process(
+        target=start_process,
+        args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
-    proc_router.start()
+    proc_controller.start()
     proc_detoken = mp.Process(
         target=start_detokenizer_process,
         args=(
@@ -377,87 +275,110 @@ def launch_server(server_args, pipe_finish_writer):
     proc_detoken.start()
 
     # Wait for the model to finish loading
-    router_init_state = pipe_router_reader.recv()
+    controller_init_state = pipe_controller_reader.recv()
     detoken_init_state = pipe_detoken_reader.recv()
 
-    if router_init_state != "init ok" or detoken_init_state != "init ok":
-        proc_router.kill()
+    if controller_init_state != "init ok" or detoken_init_state != "init ok":
+        proc_controller.kill()
         proc_detoken.kill()
-        print("router init state:", router_init_state)
-        print("detoken init state:", detoken_init_state)
+        print(
+            f"Initialization failed. controller_init_state: {controller_init_state}",
+            flush=True,
+        )
+        print(
+            f"Initialization failed. detoken_init_state: {detoken_init_state}",
+            flush=True,
+        )
         sys.exit(1)
+    assert proc_controller.is_alive() and proc_detoken.is_alive()
 
-    assert proc_router.is_alive() and proc_detoken.is_alive()
+    if server_args.api_key and server_args.api_key != "":
+        app.add_middleware(APIKeyValidatorMiddleware, api_key=server_args.api_key)
 
-    def launch_server():
-        # Launch api server
+    # Send a warmup request
+    t = threading.Thread(
+        target=_wait_and_warmup, args=(server_args, pipe_finish_writer)
+    )
+    t.start()
+
+    # Listen for requests
+    try:
         uvicorn.run(
             app,
             host=server_args.host,
             port=server_args.port,
-            log_level=server_args.log_level,
+            log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
         )
+    finally:
+        t.join()
 
-    t = threading.Thread(target=launch_server)
-    t.start()
 
-    if pipe_finish_writer:
-        url = server_args.url()
+def _wait_and_warmup(server_args, pipe_finish_writer):
+    headers = {}
+    url = server_args.url()
+    if server_args.api_key:
+        headers[API_KEY_HEADER_NAME] = server_args.api_key
 
-        success = False
-        for i in range(60):
-            time.sleep(1)
-            try:
-                res = requests.get(url + "/get_model_info", timeout=5)
-                success = True
-                break
-            except requests.exceptions.RequestException as e:
-                pass
+    # Wait until the server is launched
+    for _ in range(120):
+        time.sleep(0.5)
+        try:
+            requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            break
+        except requests.exceptions.RequestException:
+            pass
 
-        if success:
-            pipe_finish_writer.send("init ok")
-        else:
-            pipe_finish_writer.send(str(e))
+    # Send a warmup request
+    try:
+        for _ in range(server_args.dp_size):
+            res = requests.post(
+                url + "/generate",
+                json={
+                    "text": "The capital city of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                    },
+                },
+                headers=headers,
+                timeout=600,
+            )
+            assert res.status_code == 200
+    except Exception as e:
+        if pipe_finish_writer is not None:
+            pipe_finish_writer.send(get_exception_traceback())
+        print(f"Initialization failed. warmup error: {e}", flush=True)
+        raise e
+
+    logger.info("The server is fired up and ready to roll!")
+    if pipe_finish_writer is not None:
+        pipe_finish_writer.send("init ok")
 
 
 class Runtime:
+    """
+    A wrapper for the server.
+    This is used for launching the server in a python program without
+    using the commond line interface.
+    """
+
     def __init__(
         self,
-        model_path: str,
-        tokenizer_path: Optional[str] = None,
-        load_format: str = "auto",
-        tokenizer_mode: str = "auto",
-        trust_remote_code: bool = True,
-        mem_fraction_static: float = ServerArgs.mem_fraction_static,
-        max_prefill_num_token: int = ServerArgs.max_prefill_num_token,
-        tp_size: int = 1,
-        model_mode: List[str] = (),
-        schedule_heuristic: str = "lpm",
-        random_seed: int = 42,
         log_level: str = "error",
-        port: Optional[int] = None,
-        additional_ports: Optional[Union[List[int], int]] = None,
+        model_overide_args: Optional[dict] = None,
+        *args,
+        **kwargs,
     ):
-        host = "127.0.0.1"
-        port, additional_ports = handle_port_init(port, additional_ports, tp_size)
-        self.server_args = ServerArgs(
-            model_path=model_path,
-            tokenizer_path=tokenizer_path,
-            host=host,
-            port=port,
-            additional_ports=additional_ports,
-            load_format=load_format,
-            tokenizer_mode=tokenizer_mode,
-            trust_remote_code=trust_remote_code,
-            mem_fraction_static=mem_fraction_static,
-            max_prefill_num_token=max_prefill_num_token,
-            tp_size=tp_size,
-            model_mode=model_mode,
-            schedule_heuristic=schedule_heuristic,
-            random_seed=random_seed,
-            log_level=log_level,
+        """See the arguments in server_args.py::ServerArgs"""
+        self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
+
+        # Pre-allocate ports
+        self.server_args.port, self.server_args.additional_ports = allocate_init_ports(
+            self.server_args.port,
+            self.server_args.additional_ports,
+            self.server_args.dp_size,
         )
 
         self.url = self.server_args.url()
@@ -467,7 +388,10 @@ class Runtime:
 
         self.pid = None
         pipe_reader, pipe_writer = mp.Pipe(duplex=False)
-        proc = mp.Process(target=launch_server, args=(self.server_args, pipe_writer))
+        proc = mp.Process(
+            target=launch_server,
+            args=(self.server_args, model_overide_args, pipe_writer),
+        )
         proc.start()
         pipe_writer.close()
         self.pid = proc.pid
@@ -479,7 +403,9 @@ class Runtime:
 
         if init_state != "init ok":
             self.shutdown()
-            raise RuntimeError("Launch failed. Please see the error messages above.")
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
 
         self.endpoint = RuntimeEndpoint(self.url)
 
@@ -507,14 +433,13 @@ class Runtime:
     async def add_request(
         self,
         prompt: str,
-        sampling_params,
-    ) -> None:
+        sampling_params: Dict,
+    ):
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
             "stream": True,
         }
-
         pos = 0
 
         timeout = aiohttp.ClientTimeout(total=3 * 3600)

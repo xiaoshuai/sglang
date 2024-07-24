@@ -1,33 +1,30 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.router.model_runner import InputMetadata
 from torch import nn
+from vllm.config import CacheConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.controller.model_runner import InputMetadata
 
 Qwen2Config = None
 
@@ -38,17 +35,20 @@ class Qwen2MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, linear_method=linear_method
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -74,7 +74,7 @@ class Qwen2Attention(nn.Module):
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -105,13 +105,13 @@ class Qwen2Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
 
         self.rotary_emb = get_rope(
@@ -148,7 +148,7 @@ class Qwen2DecoderLayer(nn.Module):
         self,
         config: Qwen2Config,
         layer_id: int = 0,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -163,13 +163,13 @@ class Qwen2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.mlp = Qwen2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            linear_method=linear_method,
+            quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -205,7 +205,7 @@ class Qwen2Model(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -217,7 +217,7 @@ class Qwen2Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen2DecoderLayer(config, i, linear_method)
+                Qwen2DecoderLayer(config, i, quant_config=quant_config)
                 for i in range(config.num_hidden_layers)
             ]
         )
@@ -228,12 +228,12 @@ class Qwen2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        skip_embed: bool = False,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if not skip_embed:
+        if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_ids
+            hidden_states = input_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -251,34 +251,30 @@ class Qwen2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Qwen2Config,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_method = linear_method
-        self.model = Qwen2Model(config, linear_method)
+        self.quant_config = quant_config
+        self.model = Qwen2Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_metadata: InputMetadata,
-        skip_embed: bool = False,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata, skip_embed)
+        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -288,9 +284,7 @@ class Qwen2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-            model_name_or_path, cache_dir, load_format, revision
-        ):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -304,6 +298,8 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -312,9 +308,16 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                if name.startswith("model.vision_tower") and name not in params_dict:
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if (
+                    self.config.tie_word_embeddings
+                    and name == "model.embed_tokens.weight"
+                ):
+                    weight_loader(params_dict["lm_head.weight"], loaded_weight)
 
 
 EntryClass = Qwen2ForCausalLM

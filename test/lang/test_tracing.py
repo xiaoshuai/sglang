@@ -1,9 +1,8 @@
 import unittest
 
-from sglang.backend.base_backend import BaseBackend
-from sglang.lang.chat_template import get_chat_template
-
 import sglang as sgl
+from sglang.lang.backend.base_backend import BaseBackend
+from sglang.lang.chat_template import get_chat_template
 
 
 class TestTracing(unittest.TestCase):

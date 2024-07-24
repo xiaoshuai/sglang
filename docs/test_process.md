@@ -1,13 +1,18 @@
-## SRT Unit Tests
+# SRT Unit Tests
 
-### Low-level API
+### Latency Alignment
+Make sure your changes do not slow down the following benchmarks
 ```
-cd sglang/test/srt/model
+# single gpu
+python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 32 --input-len 512 --output-len 256
+python -m sglang.bench_latency --model-path meta-llama/Llama-2-7b-chat-hf --mem-fraction-static 0.8 --batch 1 --input-len 512 --output-len 256
 
-python3 test_llama_low_api.py
-python3 test_llama_extend.py
-python3 test_llava_low_api.py
-python3 bench_llama_low_api.py
+# multiple gpu
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-70B --tp 8 --mem-fraction-static 0.6 --batch 32 --input-len 8192 --output-len 1
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-70B --tp 8 --mem-fraction-static 0.6 --batch 1 --input-len 8100 --output-len 32
+
+# moe model
+python -m sglang.bench_latency --model-path databricks/dbrx-base --tp 8 --mem-fraction-static 0.6 --batch 4 --input-len 1024 --output-len 32
 ```
 
 ### High-level API
@@ -37,6 +42,23 @@ python3 bench_sglang.py --nsub 3
 # Average accuracy: 0.413
 ```
 
+#### GSM-8K
+```
+cd benchmark/gsm8k
+```
+Follow README.md to download the data.
+
+```
+python3 bench_sglang.py --num-q 200
+
+# Expected performance on A10G
+# Latency: 32.103
+# Accuracy: 0.250
+```
+
+#### More
+Please also test `benchmark/hellaswag`, `benchmark/latency_throughput`.
+
 ### More Models
 
 #### LLaVA
@@ -48,6 +70,9 @@ python3 -m sglang.launch_server --model-path liuhaotian/llava-v1.5-7b --tokenize
 ```
 cd benchmark/llava_bench
 python3 bench_sglang.py
+
+# Expected performance on A10G
+# Latency: 50.031
 ```
 
 ## SGLang Unit Tests
@@ -61,3 +86,15 @@ python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-chat-hf --port
 cd test/lang
 python3 run_all.py
 ```
+
+## OpenAI API server
+```
+cd test/srt
+python test_openai_server.py
+```
+
+## Format
+pip3 install pre-commit
+cd sglang
+pre-commit install
+pre-commit run --all-files

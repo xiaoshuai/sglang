@@ -1,31 +1,40 @@
 """Inference-only LLaVa model compatible with HuggingFace weights."""
-from typing import List, Optional
+
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
-from sglang.srt.managers.router.infer_batch import ForwardMode
-from sglang.srt.managers.router.model_runner import InputMetadata
+from torch import nn
+from transformers import (
+    CLIPVisionConfig,
+    CLIPVisionModel,
+    LlavaConfig,
+    MistralConfig,
+    Qwen2Config,
+)
+from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
+from vllm.config import CacheConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from sglang.srt.managers.controller.infer_batch import ForwardMode
+from sglang.srt.managers.controller.model_runner import InputMetadata
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
 from sglang.srt.models.llama2 import LlamaForCausalLM
-from torch import nn
-from transformers import CLIPVisionModel, LlamaConfig, LlavaConfig
-from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
-from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from sglang.srt.models.mistral import MistralForCausalLM
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 class LlavaLlamaForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlavaConfig,
-        linear_method: Optional[LinearMethodBase] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -33,7 +42,7 @@ class LlavaLlamaForCausalLM(nn.Module):
         self.config.vision_config.hidden_size = config.mm_hidden_size
         self.config.text_config.hidden_size = config.hidden_size
         self.multi_modal_projector = LlavaMultiModalProjector(config)
-        self.language_model = LlamaForCausalLM(config, linear_method)
+        self.language_model = LlamaForCausalLM(config, quant_config=quant_config)
         if "unpad" in getattr(config, "mm_patch_merge_type", ""):
             self.language_model.model.image_newline = nn.Parameter(
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
@@ -86,6 +95,7 @@ class LlavaLlamaForCausalLM(nn.Module):
 
         return image_features
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -229,20 +239,12 @@ class LlavaLlamaForCausalLM(nn.Module):
                     pt += 1
 
             return self.language_model(
-                input_embeds, positions, input_metadata, skip_embed=True
+                input_ids, positions, input_metadata, input_embeds=input_embeds
             )
         elif input_metadata.forward_mode == ForwardMode.DECODE:
-            return self.language_model(
-                input_ids, positions, input_metadata, skip_embed=False
-            )
+            return self.language_model(input_ids, positions, input_metadata)
 
-    def load_weights(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        load_format: str = "auto",
-        revision: Optional[str] = None,
-    ):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # load clip vision model by cfg['mm_vision_tower']:
         #   huggingface_name or path_of_clip_relative_to_llava_model_dir
         vision_path = self.config.mm_vision_tower
@@ -269,16 +271,14 @@ class LlavaLlamaForCausalLM(nn.Module):
             raise ValueError(f"Unexpected select feature: {self.select_feature}")
 
         # load mm_projector
-        # TODO: support TP?
         projector_weights = {
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-            model_name_or_path, cache_dir, load_format, revision
-        ):
+        weights = list(weights)
+        for name, loaded_weight in weights:
             # FIXME: why projector weights read two times?
             if "projector" in name or "vision_tower" in name:
                 for weight_name, param_name in projector_weights.items():
@@ -289,15 +289,79 @@ class LlavaLlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
         # load language model
-        self.language_model.load_weights(
-            model_name_or_path, cache_dir, load_format, revision
-        )
+        self.language_model.load_weights(weights)
 
         monkey_path_clip_vision_embed_forward()
 
     @property
     def num_patches_per_side(self):
         return self.image_size // self.patch_size
+
+
+class LlavaQwenForCausalLM(LlavaLlamaForCausalLM):
+    def __init__(
+        self,
+        config: LlavaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
+    ) -> None:
+        super().__init__(config, quant_config=quant_config, cache_config=cache_config)
+        self.config = config
+        self.vision_tower = None
+        if getattr(self.config, "vision_config", None) is None:
+            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
+
+        if getattr(self.config, "text_config", None) is None:
+            self.config.text_config = Qwen2Config(self.config._name_or_path)
+
+        self.config.vision_config.hidden_size = config.mm_hidden_size
+        self.config.text_config.hidden_size = config.hidden_size
+
+        if getattr(self.config, "projector_hidden_act", None) is None:
+            self.config.projector_hidden_act = "gelu"
+
+        if getattr(self.config, "image_token_index", None) is None:
+            self.config.image_token_index = 151646
+
+        self.multi_modal_projector = LlavaMultiModalProjector(config)
+        self.language_model = Qwen2ForCausalLM(config, quant_config=quant_config)
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+            self.language_model.model.image_newline = nn.Parameter(
+                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+            )
+
+
+class LlavaMistralForCausalLM(LlavaLlamaForCausalLM):
+    def __init__(
+        self,
+        config: LlavaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
+    ) -> None:
+        super().__init__(config, quant_config=quant_config, cache_config=cache_config)
+        self.config = config
+        self.vision_tower = None
+        if getattr(self.config, "vision_config", None) is None:
+            self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
+
+        if getattr(self.config, "text_config", None) is None:
+            self.config.text_config = MistralConfig(self.config._name_or_path)
+
+        self.config.vision_config.hidden_size = config.mm_hidden_size
+        self.config.text_config.hidden_size = config.hidden_size
+
+        if getattr(self.config, "projector_hidden_act", None) is None:
+            self.config.projector_hidden_act = "gelu"
+
+        if getattr(self.config, "image_token_index", None) is None:
+            self.config.image_token_index = 32000
+
+        self.multi_modal_projector = LlavaMultiModalProjector(config)
+        self.language_model = MistralForCausalLM(config, quant_config=quant_config)
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+            self.language_model.model.image_newline = nn.Parameter(
+                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+            )
 
 
 first_call = True
@@ -332,4 +396,4 @@ def monkey_path_clip_vision_embed_forward():
     )
 
 
-EntryClass = LlavaLlamaForCausalLM
+EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]

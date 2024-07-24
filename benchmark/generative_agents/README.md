@@ -1,3 +1,9 @@
+## Download the dataset
+
+```
+wget -O agent_calls.jsonl https://drive.google.com/uc?export=download&id=19qLpD45e9JGTKF2cUjJJegwzSUEZEKht
+```
+
 ## Run benchmark
 
 Ensure that this benchmark is run in a serial manner (using --parallel 1) to preserve any potential dependencies between requests.
@@ -22,5 +28,11 @@ python3 bench_other.py --num-events 1000 --backend vllm --parallel 1
 
 ### Benchmark guidance
 ```
-python3 bench_other.py --num-events 1000 --backend guidance --parallel 1
+python3 bench_other.py --num-events 1000 --backend guidance --parallel 1 --n-ctx 4096 --model-path path/to/gguf
+```
+
+### Benchmark lmql
+
+```
+python3 bench_other.py --num-events 1000 --backend lmql --parallel 1
 ```

@@ -1,10 +1,16 @@
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.layers.context_flashattention_nopad import context_attention_fwd
-from sglang.srt.utils import wrap_kernel_launcher
 
 CUDA_CAPABILITY = torch.cuda.get_device_capability()
+
+
+@triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
 
 
 @triton.jit
@@ -38,6 +44,7 @@ def _fwd_kernel(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    logit_cap: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -89,6 +96,10 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
         qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -125,6 +136,10 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
         qk *= sm_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
         mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
             start_n + offs_n[None, :]
         )
@@ -156,9 +171,6 @@ def _fwd_kernel(
     tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None])
 
 
-cached_kernel = None
-
-
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -175,67 +187,36 @@ def extend_attention_fwd(
     b_seq_len_extend,
     max_len_in_batch,
     max_len_extend,
+    sm_scale=None,
+    logit_cap=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
-    if CUDA_CAPABILITY[0] >= 8:
-        BLOCK_M, BLOCK_N = 128, 128
-    else:
-        BLOCK_M, BLOCK_N = 64, 64
-
     Lq, Lk, Lv, Lo = (
         q_extend.shape[-1],
         k_extend.shape[-1],
         v_extend.shape[-1],
         o_extend.shape[-1],
     )
-    assert Lq == Lk and Lk == Lv and Lv == Lo
-    assert Lq in {16, 32, 64, 128}
 
-    sm_scale = 1.0 / (Lq**0.5)
+    assert Lq == Lk and Lk == Lv and Lv == Lo
+    assert Lq in {16, 32, 64, 128, 256}
+
+    if CUDA_CAPABILITY[0] >= 8:
+        BLOCK_M, BLOCK_N = (128, 128) if Lq <= 128 else (64, 64)
+    else:
+        BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
+    sm_scale = 1.0 / (Lq**0.5) if sm_scale is None else sm_scale
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_warps = 4 if Lk <= 64 else 8
     num_stages = 1
-
-    global cached_kernel
-    if cached_kernel:
-        cached_kernel(
-            grid,
-            num_warps,
-            q_extend,
-            k_extend,
-            v_extend,
-            o_extend,
-            k_buffer,
-            v_buffer,
-            req_to_tokens,
-            b_req_idx,
-            b_seq_len,
-            b_start_loc_extend,
-            b_seq_len_extend,
-            sm_scale,
-            kv_group_num,
-            q_extend.stride(0),
-            q_extend.stride(1),
-            k_extend.stride(0),
-            k_extend.stride(1),
-            v_extend.stride(0),
-            v_extend.stride(1),
-            o_extend.stride(0),
-            o_extend.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
-            req_to_tokens.stride(0),
-        )
-        return
 
     _fwd_kernel[grid](
         q_extend,
@@ -269,8 +250,8 @@ def extend_attention_fwd(
         BLOCK_N=BLOCK_N,
         num_warps=num_warps,
         num_stages=num_stages,
+        logit_cap=logit_cap,
     )
-    cached_kernel = wrap_kernel_launcher(_fwd_kernel)
 
 
 def redundant_attention(
