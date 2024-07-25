@@ -1,5 +1,5 @@
 <div align="center">
-<img src="assets/logo.png" alt="logo" width="400"></img>
+<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400"></img>
 </div>
 
 --------------------------------------------------------------------------------
@@ -37,7 +37,7 @@ The core features include:
 
 ### Method 1: With pip
 ```
-pip install --upgrade pip setuptools wheel
+pip install --upgrade pip
 pip install "sglang[all]"
 
 # Install FlashInfer CUDA kernels
@@ -70,11 +70,6 @@ docker run --gpus all \
 ```
 
 ### Common Notes
-- If you see errors from the Triton compiler, please install the [Triton Nightly](https://triton-lang.org/main/getting-started/installation.html) by
-```
-pip uninstall -y triton triton-nightly
-pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
-```
 - If you cannot install FlashInfer, check out its [installation](https://docs.flashinfer.ai/installation.html#) page. If you still cannot install it, you can use the slower Triton kernels by adding `--disable-flashinfer` when launching the server.
 - If you only need to use the OpenAI backend, you can avoid installing other dependencies by using `pip install "sglang[openai]"`.
 
@@ -157,10 +152,11 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ```
 - If the model does not have a template in the Hugging Face tokenizer, you can specify a [custom chat template](docs/custom_chat_template.md).
 - To enable fp8 quantization, you can add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
+- To enable experimental torch.compile support, you can add `--enable-torch-compile`. It accelerates small models on small batch sizes.
 
 ### Supported Models
 
-- Llama / Llama 2 / Llama 3
+- Llama / Llama 2 / Llama 3 / Llama 3.1
 - Mistral / Mixtral
 - Gemma / Gemma 2
 - Qwen / Qwen 2 / Qwen 2 MoE
