@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/backend_request_func.py
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
+
 """
 Benchmark online serving.
 
@@ -20,10 +21,10 @@ import sys
 import time
 import traceback
 import warnings
-from argparse import ArgumentParser as FlexibleArgumentParser
+from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import AsyncGenerator, List, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -38,6 +39,8 @@ from transformers import (
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+global args
+
 
 @dataclass
 class RequestFuncInput:
@@ -46,6 +49,7 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
+    extra_request_body: Dict[str, Any]
 
 
 @dataclass
@@ -83,7 +87,11 @@ async def async_request_trt_llm(
             "stream": True,
             "min_length": request_func_input.output_len,
             "end_id": 1048576,
+            **request_func_input.extra_request_body,
         }
+        if args.disable_ignore_eos:
+            del payload["min_length"]
+            del payload["end_id"]
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
 
@@ -141,15 +149,18 @@ async def async_request_openai_completions(
         "completions"
     ), "OpenAI Completions API URL must end with 'completions'."
 
+    prompt = request_func_input.prompt
+
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "model": request_func_input.model,
-            "prompt": request_func_input.prompt,
+            "prompt": prompt,
             "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
-            "ignore_eos": True,
+            "ignore_eos": not args.disable_ignore_eos,
+            **request_func_input.extra_request_body,
         }
         headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
 
@@ -188,7 +199,8 @@ async def async_request_openai_completions(
                                     output.ttft = ttft
 
                                 # Decoding phase
-                                output.itl.append(timestamp - most_recent_timestamp)
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
@@ -210,6 +222,13 @@ async def async_request_openai_completions(
     return output
 
 
+async def async_request_gserver(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    raise NotImplementedError()
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
         import huggingface_hub.constants
@@ -228,6 +247,13 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+    if pretrained_model_name_or_path.endswith(
+        ".json"
+    ) or pretrained_model_name_or_path.endswith(".model"):
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+
+        return get_tokenizer(pretrained_model_name_or_path)
+
     if pretrained_model_name_or_path is not None and not os.path.exists(
         pretrained_model_name_or_path
     ):
@@ -242,6 +268,7 @@ ASYNC_REQUEST_FUNCS = {
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
     "trt": async_request_trt_llm,
+    "gserver": async_request_gserver,
 }
 
 
@@ -341,9 +368,9 @@ def sample_sharegpt_requests(
 
         # Tokenize the prompts and completions.
         prompt = dataset[i][0]
-        prompt_token_ids = tokenizer(prompt).input_ids
+        prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
-        completion_token_ids = tokenizer(completion).input_ids
+        completion_token_ids = tokenizer.encode(completion)
         prompt_len = len(prompt_token_ids)
         output_len = (
             len(completion_token_ids) if fixed_output_len is None else fixed_output_len
@@ -351,7 +378,9 @@ def sample_sharegpt_requests(
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > 1024 or (
+            prompt_len + output_len > 2048 and fixed_output_len is None
+        ):
             # Prune too long sequences.
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
@@ -369,7 +398,7 @@ def sample_random_requests(
 ) -> List[Tuple[str, int, int]]:
 
     input_lens = np.random.randint(
-        int(input_len * range_ratio),
+        max(int(input_len * range_ratio), 1),
         input_len + 1,
         size=num_prompts,
     )
@@ -412,10 +441,10 @@ def sample_random_requests(
         for i in range(num_prompts):
             # Tokenize the prompts and completions.
             prompt = dataset[i][0]
-            prompt_token_ids = tokenizer(prompt).input_ids
+            prompt_token_ids = tokenizer.encode(prompt)
             prompt_len = len(prompt_token_ids)
 
-            if prompt_len <= input_lens[i]:
+            if prompt_len > input_lens[i]:
                 input_ids = prompt_token_ids[: input_lens[i]]
             else:
                 ratio = (input_lens[i] + prompt_len - 1) // prompt_len
@@ -478,7 +507,7 @@ def calculate_metrics(
             output_len = outputs[i].output_len
             output_lens.append(output_len)
             retokenized_output_len = len(
-                tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids
+                tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
             total_input += input_requests[i][1]
@@ -537,7 +566,7 @@ async def benchmark(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
-    enable_multi: bool,
+    extra_request_body: Dict[str, Any],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -552,6 +581,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
+        extra_request_body=extra_request_body,
     )
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
@@ -574,6 +604,7 @@ async def benchmark(
             api_url=api_url,
             prompt_len=prompt_len,
             output_len=output_len,
+            extra_request_body=extra_request_body,
         )
         tasks.append(
             asyncio.create_task(
@@ -656,19 +687,20 @@ async def benchmark(
             "backend": args.backend,
             "dataset_name": args.dataset_name,
             "request_rate": request_rate,
-            "total_input": metrics.total_input,
-            "total_output": metrics.total_output,
-            "total_output_retokenized": metrics.total_output_retokenized,
-            "mean_e2e_latency": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency": metrics.median_e2e_latency_ms,
-            "median_ttft": metrics.median_ttft_ms,
-            "median_itl": metrics.median_itl_ms,
-            "output_token_throughput": metrics.output_throughput,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+            "median_ttft_ms": metrics.median_ttft_ms,
+            "median_itl_ms": metrics.median_itl_ms,
+            "output_throughput": metrics.output_throughput,
             "sharegpt_output_len": args.sharegpt_output_len,
             "random_input_len": args.random_input_len,
             "random_output_len": args.random_output_len,
             "random_range_ratio": args.random_range_ratio,
-            "benchmark_duration": benchmark_duration,
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -738,16 +770,27 @@ def check_chat_template(model_path):
         return False
 
 
-def fire(args: argparse.Namespace):
+def run_benchmark(args_: argparse.Namespace):
+    global args
+    args = args_
+
+    # Set global environments
+    set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    extra_request_body = {}
+    if args.extra_request_body:
+        extra_request_body = json.loads(args.extra_request_body)
+
+    # Set url
     if args.port is None:
         args.port = {
             "sglang": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
+            "gserver": 9988,
         }.get(args.backend, 30000)
 
     api_url = (
@@ -770,7 +813,11 @@ def fire(args: argparse.Namespace):
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
+    elif args.backend == "gserver":
+        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+        args.model = args.model or "default"
 
+    # Get model name
     if args.model is None:
         try:
             response = requests.get(model_url)
@@ -795,6 +842,7 @@ def fire(args: argparse.Namespace):
 
     print(f"{args}\n")
 
+    # Read dataset
     backend = args.backend
     model_id = args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
@@ -820,7 +868,21 @@ def fire(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    if args.multi:
+    if not args.multi:
+        return asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                disable_tqdm=args.disable_tqdm,
+                extra_request_body=extra_request_body,
+            )
+        )
+    else:
+        # Benchmark multiple rps. TODO: use a fixed duration to compute num_prompts
         request_rates = parse_request_rate_range(args.request_rate_range)
 
         for rate in request_rates:
@@ -833,25 +895,11 @@ def fire(args: argparse.Namespace):
                     input_requests=input_requests,
                     request_rate=rate,
                     disable_tqdm=args.disable_tqdm,
-                    enable_multi=args.multi,
+                    extra_request_body=extra_request_body,
                 )
             )
-    else:
-        asyncio.run(
-            benchmark(
-                backend=backend,
-                api_url=api_url,
-                model_id=model_id,
-                tokenizer=tokenizer,
-                input_requests=input_requests,
-                request_rate=args.request_rate,
-                disable_tqdm=args.disable_tqdm,
-                enable_multi=args.multi,
-            )
-        )
 
 
-# to avoid relying on SGLang's components
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
@@ -864,14 +912,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 if __name__ == "__main__":
-    parser = FlexibleArgumentParser(
-        description="Benchmark the online serving throughput."
-    )
+    parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",
         type=str,
-        required=True,
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
+        default="sglang",
         help="Must specify a backend, depending on the LLM Inference Engine.",
     )
     parser.add_argument(
@@ -935,7 +981,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-range-ratio",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Range of sampled ratio of input/output length, "
         "used only for random dataset.",
     )
@@ -944,14 +990,9 @@ if __name__ == "__main__":
         type=float,
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is 128.0.",
+        "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Default is 0.")
-    parser.add_argument(
-        "--disable-tqdm",
-        action="store_true",
-        help="Specify to disable tqdm progress bar.",
-    )
+    parser.add_argument("--seed", type=int, default=1, help="The random seed.")
     parser.add_argument(
         "--multi",
         action="store_true",
@@ -965,12 +1006,26 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
+    parser.add_argument(
         "--disable-stream",
         action="store_true",
         help="Disable streaming mode.",
     )
-
-    set_ulimit()
-
+    parser.add_argument(
+        "--disable-ignore-eos",
+        action="store_true",
+        help="Disable ignoring EOS.",
+    )
+    parser.add_argument(
+        "--extra-request-body",
+        metavar='{"key1": "value1", "key2": "value2"}',
+        type=str,
+        help="Append given JSON object to the request payload. You can use this to specify"
+        "additional generate params like sampling params.",
+    )
     args = parser.parse_args()
-    fire(args)
+    run_benchmark(args)

@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 """Common utilities."""
 
 import base64
@@ -11,7 +26,7 @@ import struct
 import time
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import psutil
@@ -20,7 +35,6 @@ import torch
 import torch.distributed as dist
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
-from starlette.middleware.base import BaseHTTPMiddleware
 from torch.nn.parameter import Parameter
 from triton.runtime.cache import (
     FileCacheManager,
@@ -179,33 +193,30 @@ def allocate_init_ports(
     return ret_ports[0], ret_ports[1:num_ports_needed]
 
 
-def get_int_token_logit_bias(tokenizer, vocab_size):
-    """Get the logit bias for integer-only tokens."""
-    # a bug when model's vocab size > tokenizer.vocab_size
-    vocab_size = tokenizer.vocab_size
-    logit_bias = np.zeros(vocab_size, dtype=np.float32)
-    for t_id in range(vocab_size):
-        ss = tokenizer.decode([t_id]).strip()
-        if not (ss.isdigit() or len(ss) == 0 or t_id == tokenizer.eos_token_id):
-            logit_bias[t_id] = -1e5
+def is_multimodal_model(model_architectures):
+    if (
+        "LlavaLlamaForCausalLM" in model_architectures
+        or "LlavaQwenForCausalLM" in model_architectures
+        or "LlavaMistralForCausalLM" in model_architectures
+        or "LlavaVidForCausalLM" in model_architectures
+    ):
+        return True
+    else:
+        return False
 
-    return logit_bias
 
+def is_generation_model(model_architectures, is_embedding: bool = False):
+    # We have two ways to determine whether a model is a generative model.
+    # 1. Check the model architectue
+    # 2. check the `is_embedding` server args
 
-def is_multimodal_model(model):
-    from sglang.srt.model_config import ModelConfig
-
-    if isinstance(model, str):
-        model = model.lower()
-        return "llava" in model or "yi-vl" in model or "llava-next" in model
-
-    if isinstance(model, ModelConfig):
-        model_path = model.path.lower()
-        return (
-            "llava" in model_path or "yi-vl" in model_path or "llava-next" in model_path
-        )
-
-    raise ValueError("unrecognized type")
+    if (
+        "LlamaEmbeddingModel" in model_architectures
+        or "MistralModel" in model_architectures
+    ):
+        return False
+    else:
+        return not is_embedding
 
 
 def decode_video_base64(video_base64):
@@ -287,12 +298,14 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_image(image_file):
+def load_image(image_file: Union[str, bytes]):
     from PIL import Image
 
     image = image_size = None
 
-    if image_file.startswith("http://") or image_file.startswith("https://"):
+    if isinstance(image_file, bytes):
+        image = Image.open(BytesIO(image_file))
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         image = Image.open(BytesIO(response.content))
@@ -304,8 +317,10 @@ def load_image(image_file):
     elif image_file.startswith("video:"):
         image_file = image_file.replace("video:", "")
         image, image_size = decode_video_base64(image_file)
-    else:
+    elif isinstance(image_file, str):
         image = Image.open(BytesIO(base64.b64decode(image_file)))
+    else:
+        raise ValueError(f"Invalid image: {image}")
 
     return image, image_size
 
@@ -322,7 +337,7 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.WARN)
+    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -344,11 +359,30 @@ def kill_parent_process():
     """Kill the parent process and all children of the parent process."""
     current_process = psutil.Process()
     parent_process = current_process.parent()
-    children = parent_process.children(recursive=True)
+    kill_child_process(parent_process.pid, skip_pid=current_process.pid)
+
+
+def kill_child_process(pid, including_parent=True, skip_pid=None):
+    """Kill the process and all its children process."""
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = parent.children(recursive=True)
     for child in children:
-        if child.pid != current_process.pid:
-            os.kill(child.pid, 9)
-    os.kill(parent_process.pid, 9)
+        if child.pid == skip_pid:
+            continue
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+    if including_parent:
+        try:
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -373,7 +407,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         DummyModelLoader,
         LoRAConfig,
         ModelConfig,
-        MultiModalConfig,
         ParallelConfig,
         SchedulerConfig,
         _initialize_model,
@@ -388,7 +421,6 @@ def monkey_patch_vllm_dummy_weight_loader():
         model_config: ModelConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
-        multimodal_config: Optional[MultiModalConfig],
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
@@ -399,7 +431,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                     model_config,
                     self.load_config,
                     lora_config,
-                    multimodal_config,
                     cache_config,
                 )
 
@@ -407,10 +438,6 @@ def monkey_patch_vllm_dummy_weight_loader():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
-                # FIXME: Remove this after Mixtral is updated
-                # to use quant_method.
-                if hasattr(module, "process_weights_after_loading"):
-                    module.process_weights_after_loading()
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
             # random values to the weights.
@@ -502,26 +529,6 @@ class CustomCacheManager(FileCacheManager):
                 os.makedirs(self.cache_dir, exist_ok=True)
             else:
                 raise RuntimeError("Could not create or locate cache dir")
-
-
-API_KEY_HEADER_NAME = "X-API-Key"
-
-
-class APIKeyValidatorMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, api_key: str):
-        super().__init__(app)
-        self.api_key = api_key
-
-    async def dispatch(self, request, call_next):
-        # extract API key from the request headers
-        api_key_header = request.headers.get(API_KEY_HEADER_NAME)
-        if not api_key_header or api_key_header != self.api_key:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Invalid API Key"},
-            )
-        response = await call_next(request)
-        return response
 
 
 def get_ip_address(ifname):
@@ -618,7 +625,7 @@ def set_ulimit(target_soft_limit=65535):
             logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
-def is_llama3_405b_fp8(model_config):
+def is_llama3_405b_fp8_head_16(model_config):
     """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
     if (
         model_config.hf_config.architectures[0] == "LlamaForCausalLM"
@@ -626,6 +633,7 @@ def is_llama3_405b_fp8(model_config):
         and model_config.hf_config.intermediate_size == 53248
         and model_config.hf_config.num_hidden_layers == 126
         and model_config.hf_config.num_key_value_heads == 16
+        and hasattr(model_config.hf_config, "quantization_config")
         and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
     ):
         return True
@@ -664,3 +672,45 @@ def monkey_patch_vllm_qvk_linear_loader():
         origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
 
     setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
+
+
+def add_api_key_middleware(app, api_key: str):
+    @app.middleware("http")
+    async def authentication(request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path.startswith("/health"):
+            return await call_next(request)
+        if request.headers.get("Authorization") != "Bearer " + api_key:
+            return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+def prepare_model(model_path: str):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(model_path)
+    return model_path
+
+
+def prepare_tokenizer(tokenizer_path: str):
+    if "SGLANG_USE_MODELSCOPE" in os.environ:
+        if not os.path.exists(tokenizer_path):
+            from modelscope import snapshot_download
+
+            return snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return tokenizer_path
+
+
+def configure_logger(server_args, prefix: str = ""):
+    format = f"[%(asctime)s{prefix}] %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format=format,
+        datefmt="%H:%M:%S",
+        force=True,
+    )

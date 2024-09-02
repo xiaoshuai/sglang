@@ -1,3 +1,18 @@
+"""
+Copyright 2023-2024 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
@@ -9,8 +24,11 @@ from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -19,13 +37,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.managers.controller.model_runner import InputMetadata
-
-MergedColumnParallelLinear = None
-QKVParallelLinear = None
-RowParallelLinear = None
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.model_executor.forward_batch_info import InputMetadata
 
 
 class LlamaMLP(nn.Module):
@@ -280,29 +297,13 @@ class LlamaForCausalLM(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         efficient_weight_load=False,
     ) -> None:
-        global MergedColumnParallelLinear
-        global QKVParallelLinear
-        global RowParallelLinear
-
-        if efficient_weight_load:
-            from sglang.srt.layers.linear import (
-                MergedColumnParallelLinear,
-                QKVParallelLinear,
-                RowParallelLinear,
-            )
-        else:
-            from vllm.model_executor.layers.linear import (
-                MergedColumnParallelLinear,
-                QKVParallelLinear,
-                RowParallelLinear,
-            )
-
         super().__init__()
         self.config = config
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
+        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
@@ -311,11 +312,13 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
+        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
+        return sample_output, logits_output
 
     def get_module_name(self, name):
         stacked_params_mapping = [
@@ -358,14 +361,15 @@ class LlamaForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 return
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                return
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -374,8 +378,6 @@ class LlamaForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    return
-                if name.startswith("model.vision_tower") and name not in params_dict:
                     return
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
