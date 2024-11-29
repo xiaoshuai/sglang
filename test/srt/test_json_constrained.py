@@ -1,10 +1,15 @@
+"""
+python3 -m unittest test_json_constrained.TestJSONConstrained.test_json_generate
+"""
+
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import openai
 import requests
 
-from sglang.srt.utils import kill_child_process
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_URL_FOR_TEST,
@@ -12,12 +17,11 @@ from sglang.test.test_utils import (
 )
 
 
-class TestJSONConstrained(unittest.TestCase):
+class TestJSONConstrainedOutlinesBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
         cls.json_schema = json.dumps(
             {
                 "type": "object",
@@ -29,15 +33,22 @@ class TestJSONConstrained(unittest.TestCase):
             }
         )
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=300, api_key=cls.api_key
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=[
+                "--max-running-requests",
+                "10",
+                "--grammar-backend",
+                "outlines",
+            ],
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_child_process(cls.process.pid)
+        kill_process_tree(cls.process.pid)
 
-    def run_decode(self, return_logprob=False, top_logprobs_num=0, n=1):
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+    def run_decode(self, json_schema, return_logprob=False, top_logprobs_num=0, n=1):
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -47,29 +58,42 @@ class TestJSONConstrained(unittest.TestCase):
                     "max_new_tokens": 128,
                     "n": n,
                     "stop_token_ids": [119690],
-                    "json_schema": self.json_schema,
+                    "json_schema": json_schema,
                 },
                 "stream": False,
                 "return_logprob": return_logprob,
                 "top_logprobs_num": top_logprobs_num,
                 "logprob_start_len": 0,
             },
-            headers=headers,
         )
-        print(json.dumps(response.json()))
+        ret = response.json()
+        print(json.dumps(ret))
         print("=" * 100)
+
+        if not json_schema:
+            return
+
+        # Make sure the json output is valid
         try:
-            js_obj = json.loads(response.json()["text"])
+            js_obj = json.loads(ret["text"])
         except (TypeError, json.decoder.JSONDecodeError):
             raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
+
+        self.assertIsInstance(js_obj["name"], str)
+        self.assertIsInstance(js_obj["population"], int)
+
+        # Make sure jump forward is triggered
+        # NOTE: This is skipped because overlap scheduler does not support jump forward
+        # self.assertGreater(
+        #     ret["meta_info"]["completion_tokens"],
+        #     ret["meta_info"]["completion_tokens_wo_jump_forward"],
+        # )
 
     def test_json_generate(self):
-        self.run_decode()
+        self.run_decode(json_schema=self.json_schema)
 
     def test_json_openai(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        client = openai.Client(api_key="EMPTY", base_url=f"{self.base_url}/v1")
 
         response = client.chat.completions.create(
             model=self.model,
@@ -79,7 +103,10 @@ class TestJSONConstrained(unittest.TestCase):
             ],
             temperature=0,
             max_tokens=128,
-            extra_body={"json_schema": self.json_schema},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "foo", "schema": json.loads(self.json_schema)},
+            },
         )
         text = response.choices[0].message.content
 
@@ -88,8 +115,43 @@ class TestJSONConstrained(unittest.TestCase):
         except (TypeError, json.decoder.JSONDecodeError):
             print("JSONDecodeError", text)
             raise
-        assert isinstance(js_obj["name"], str)
-        assert isinstance(js_obj["population"], int)
+
+        self.assertIsInstance(js_obj["name"], str)
+        self.assertIsInstance(js_obj["population"], int)
+
+    def test_mix_json_and_other(self):
+        json_schemas = [None, None, self.json_schema, self.json_schema] * 10
+
+        with ThreadPoolExecutor(len(json_schemas)) as executor:
+            list(executor.map(self.run_decode, json_schemas))
+
+
+class TestJSONConstrainedXGrammarBackend(TestJSONConstrainedOutlinesBackend):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.json_schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "population": {"type": "integer"},
+                },
+                "required": ["name", "population"],
+            }
+        )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=[
+                "--max-running-requests",
+                "10",
+                "--grammar-backend",
+                "xgrammar",
+            ],
+        )
 
 
 if __name__ == "__main__":

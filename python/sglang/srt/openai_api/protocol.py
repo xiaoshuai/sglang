@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
 import time
@@ -36,7 +34,7 @@ class ModelList(BaseModel):
     """Model list consists of model cards."""
 
     object: str = "list"
-    data: List[ModelCard] = []
+    data: List[ModelCard] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
@@ -76,10 +74,20 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    # only used to return cached tokens when --enable-cache-report is set
+    prompt_tokens_details: Optional[Dict[str, int]] = None
 
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+
+
+class JsonSchemaResponseFormat(BaseModel):
+    name: str
+    description: Optional[str] = None
+    # use alias to workaround pydantic conflict
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    strict: Optional[bool] = False
 
 
 class FileRequest(BaseModel):
@@ -133,7 +141,7 @@ class BatchResponse(BaseModel):
     expired_at: Optional[int] = None
     cancelling_at: Optional[int] = None
     cancelled_at: Optional[int] = None
-    request_counts: dict = {"total": 0, "completed": 0, "failed": 0}
+    request_counts: Optional[dict] = None
     metadata: Optional[dict] = None
 
 
@@ -143,29 +151,31 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: Union[List[int], List[List[int]], str, List[str]]
     best_of: Optional[int] = None
-    echo: Optional[bool] = False
-    frequency_penalty: Optional[float] = 0.0
+    echo: bool = False
+    frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: int = 16
     n: int = 1
-    presence_penalty: Optional[float] = 0.0
+    presence_penalty: float = 0.0
     seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    stream: bool = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: float = 1.0
+    top_p: float = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    regex: Optional[str] = None
     json_schema: Optional[str] = None
-    ignore_eos: Optional[bool] = False
-    min_tokens: Optional[int] = 0
-    repetition_penalty: Optional[float] = 1.0
-    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    regex: Optional[str] = None
+    min_tokens: int = 0
+    repetition_penalty: float = 1.0
+    stop_token_ids: Optional[List[int]] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
 
 
 class CompletionResponseChoice(BaseModel):
@@ -173,6 +183,7 @@ class CompletionResponseChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionResponse(BaseModel):
@@ -189,6 +200,7 @@ class CompletionResponseStreamChoice(BaseModel):
     text: str
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -213,6 +225,7 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
+    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
 
 ChatCompletionMessageContentPart = Union[
@@ -221,7 +234,7 @@ ChatCompletionMessageContentPart = Union[
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant"]
+    role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart]]
 
 
@@ -236,8 +249,8 @@ ChatCompletionMessageParam = Union[
 
 
 class ResponseFormat(BaseModel):
-    # type must be "json_object" or "text"
-    type: Literal["text", "json_object"]
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -245,28 +258,30 @@ class ChatCompletionRequest(BaseModel):
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
     model: str
-    frequency_penalty: Optional[float] = 0.0
+    frequency_penalty: float = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[bool] = False
+    logprobs: bool = False
     top_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
-    n: Optional[int] = 1
-    presence_penalty: Optional[float] = 0.0
+    n: int = 1
+    presence_penalty: float = 0.0
     response_format: Optional[ResponseFormat] = None
     seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
-    stream: Optional[bool] = False
+    stop: Optional[Union[str, List[str]]] = None
+    stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
+    temperature: float = 0.7
+    top_p: float = 1.0
     user: Optional[str] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     regex: Optional[str] = None
-    json_schema: Optional[str] = None
-    min_tokens: Optional[int] = 0
-    repetition_penalty: Optional[float] = 1.0
-    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
+    min_tokens: int = 0
+    repetition_penalty: float = 1.0
+    stop_token_ids: Optional[List[int]] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
 
 
 class ChatMessage(BaseModel):
@@ -279,6 +294,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: str
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -300,6 +316,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

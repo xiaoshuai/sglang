@@ -161,10 +161,12 @@ cython_debug/
 
 # MacOS
 .DS_Store
-*.json
 
 # Vim
 *.swp
+
+# Documentation
+docs/_build
 
 # SGL
 benchmark/mmlu/data
