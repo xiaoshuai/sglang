@@ -424,6 +424,7 @@ def popen_launch_server(
         port,
         *other_args,
     ]
+
     if api_key:
         command += ["--api-key", api_key]
 
@@ -567,6 +568,7 @@ def run_bench_serving(
         disable_tqdm=False,
         disable_stream=disable_stream,
         disable_ignore_eos=False,
+        lora_name=None,
         extra_request_body=None,
         profile=None,
     )
@@ -814,3 +816,8 @@ def run_mulit_request_test(
         chunked_prefill_size,
         assert_has_abort=False,
     )
+
+
+def write_github_step_summary(content):
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        f.write(content)

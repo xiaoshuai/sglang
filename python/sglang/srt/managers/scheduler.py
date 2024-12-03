@@ -38,13 +38,19 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    UpdateWeightReqInput,
-    UpdateWeightReqOutput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -141,9 +147,12 @@ class Scheduler:
         self.model_config = ModelConfig(
             server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
             context_length=server_args.context_length,
             model_override_args=server_args.json_model_override_args,
             is_embedding=server_args.is_embedding,
+            dtype=server_args.dtype,
+            quantization=server_args.quantization,
         )
         self.is_generation = self.model_config.is_generation
 
@@ -253,6 +262,8 @@ class Scheduler:
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.chunked_prefill_size <= 0:  # -1 means disable
+            self.chunked_prefill_size = None
         self.being_chunked_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
@@ -504,11 +515,27 @@ class Scheduler:
                 self.flush_cache()
             elif isinstance(recv_req, AbortReq):
                 self.abort_request(recv_req)
-            elif isinstance(recv_req, UpdateWeightReqInput):
-                success, message = self.update_weights(recv_req)
+            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                success, message = self.update_weights_from_disk(recv_req)
                 self.send_to_tokenizer.send_pyobj(
-                    UpdateWeightReqOutput(success, message)
+                    UpdateWeightFromDiskReqOutput(success, message)
                 )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                success, message = self.init_weights_update_group(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success, message)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                success, message = self.update_weights_from_distributed(recv_req)
+                self.send_to_tokenizer.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success, message)
+                )
+            elif isinstance(recv_req, GetWeightsByNameReqInput):
+                parameter = self.get_weights_by_name(recv_req)
+                self.send_to_tokenizer.send_pyobj(GetWeightsByNameReqOutput(parameter))
             elif isinstance(recv_req, ProfileReq):
                 if recv_req == ProfileReq.START_PROFILE:
                     self.start_profile()
@@ -653,7 +680,7 @@ class Scheduler:
 
         self.waiting_queue.append(req)
 
-    def log_prefill_stats(self, adder, can_run_list, running_bs, has_inflight):
+    def log_prefill_stats(self, adder, can_run_list, running_bs, has_being_chunked):
         if isinstance(self.tree_cache, RadixCache):
             self.tree_cache_metrics["total"] += (
                 adder.log_input_tokens + adder.log_hit_tokens
@@ -677,14 +704,14 @@ class Scheduler:
             f"cache hit rate: {100.0 * tree_cache_hit_rate:.2f}%, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
             f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue) + has_inflight}"
+            f"#queue-req: {len(self.waiting_queue) + has_being_chunked}"
         )
 
         if self.enable_metrics:
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(num_used / self.max_total_num_tokens, 2)
-            self.stats.num_queue_reqs = len(self.waiting_queue) + has_inflight
+            self.stats.num_queue_reqs = len(self.waiting_queue) + has_being_chunked
             self.stats.cache_hit_rate = tree_cache_hit_rate
             self.metrics_collector.log_stats(self.stats)
 
@@ -745,7 +772,7 @@ class Scheduler:
                 # Move the chunked request out of the batch
                 self.last_batch.filter_batch(being_chunked_req=self.being_chunked_req)
                 self.tree_cache.cache_unfinished_req(self.being_chunked_req)
-                # Inflight request keeps its rid but will get a new req_pool_idx
+                # being chunked request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.being_chunked_req.req_pool_idx)
                 self.batch_is_full = False
 
@@ -796,10 +823,10 @@ class Scheduler:
             running_bs if self.is_mixed_chunk else 0,
         )
 
-        has_inflight = self.being_chunked_req is not None
-        if has_inflight:
+        has_being_chunked = self.being_chunked_req is not None
+        if has_being_chunked:
             self.being_chunked_req.init_next_round_input()
-            self.being_chunked_req = adder.add_inflight_req(self.being_chunked_req)
+            self.being_chunked_req = adder.add_being_chunked_req(self.being_chunked_req)
 
         if self.lora_paths:
             lora_set = (
@@ -841,16 +868,16 @@ class Scheduler:
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if adder.new_inflight_req is not None:
+        if adder.new_being_chunked_req is not None:
             assert self.being_chunked_req is None
-            self.being_chunked_req = adder.new_inflight_req
+            self.being_chunked_req = adder.new_being_chunked_req
 
         if self.being_chunked_req:
             self.being_chunked_req.is_being_chunked += 1
 
         # Print stats
         if self.tp_rank == 0:
-            self.log_prefill_stats(adder, can_run_list, running_bs, has_inflight)
+            self.log_prefill_stats(adder, can_run_list, running_bs, has_being_chunked)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -1023,7 +1050,7 @@ class Scheduler:
                     if req.grammar is not None:
                         req.grammar.accept_token(next_token_id)
                 else:
-                    # Inflight reqs' prefill is not finished
+                    # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
             if batch.next_batch_sampling_info:
@@ -1051,7 +1078,7 @@ class Scheduler:
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
-                    # Inflight reqs' prefill is not finished
+                    # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
 
         self.stream_output(batch.reqs)
@@ -1146,6 +1173,14 @@ class Scheduler:
                 + 1 : len(req.fill_ids)
                 - req.last_update_decode_tokens
             ]
+
+            # Clip the padded hash values from image tokens.
+            # Otherwise, it will lead to detokenization errors.
+            input_token_ids = [
+                x if x < self.model_config.vocab_size - 1 else 0
+                for x in input_token_ids
+            ]
+
             req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
 
             if (
@@ -1361,15 +1396,36 @@ class Scheduler:
                     req.to_abort = True
                     break
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        """In-place update of the weights."""
-        success, message = self.tp_worker.update_weights(recv_req)
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        """In-place update of the weights from disk."""
+        success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        """Initialize the online model parameter update group."""
+        success, message = self.tp_worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        """Update the online model parameter."""
+        success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+        if success:
+            flash_cache_success = self.flush_cache()
+            assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        parameter = self.tp_worker.get_weights_by_name(recv_req)
+        return parameter
 
     def start_profile(self) -> None:
         if self.profiler is None:
