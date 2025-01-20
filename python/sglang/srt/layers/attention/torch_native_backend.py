@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -22,43 +22,6 @@ class TorchNativeAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         pass
-
-    def init_cuda_graph_state(self, max_bs: int):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor] = None,
-    ):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        # TODO: Support CUDA graph
-        raise ValueError(
-            "Torch native attention does not support CUDA graph for now. Please --disable-cuda-graph"
-        )
 
     def _run_sdpa_forward_extend(
         self,
@@ -216,16 +179,23 @@ class TorchNativeAttnBackend(AttentionBackend):
         return output
 
     def forward_extend(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -249,7 +219,13 @@ class TorchNativeAttnBackend(AttentionBackend):
         return o
 
     def forward_decode(
-        self, q, k, v, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -260,9 +236,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.out_cache_loc, k, v
-        )
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
